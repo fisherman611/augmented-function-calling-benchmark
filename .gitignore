@@ -203,6 +203,10 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Generated filtered ToolMind data
+toolmind_tool_calls_only/
+augmented_toolmind/
+
 # Ruff stuff:
 .ruff_cache/
 
