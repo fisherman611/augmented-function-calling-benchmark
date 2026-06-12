@@ -1,0 +1,33 @@
+Create one hallucination_missing_tool Augmented ToolMind record.
+
+Goal:
+Turn the source sample into a case where the assistant must recognize that it
+cannot safely complete the original request because a required tool, argument,
+or tool result is unavailable. The assistant must not hallucinate capabilities,
+arguments, or results.
+
+Use the mutation field from the input JSON as the source of missing information.
+
+Generation procedure to follow internally:
+1. Identify the original user goal and the tool/action that would normally solve it.
+2. Identify exactly what the mutation removes or obscures.
+3. Build a shortened, valid conversation where the assistant responds safely.
+4. If a tool was removed, remove that tool from tools and do not call it.
+5. If an argument is missing, do not guess the argument.
+6. If a tool result is missing, do not reuse or fabricate that result.
+7. Prefer a concise assistant response that explains what is missing and asks
+   for the next usable input or alternative, when appropriate.
+
+Output requirements:
+- Return exactly one JSON object.
+- task_type must be hallucination_missing_tool.
+- Use the requested task_id exactly.
+- Include conversations, tools, metadata, disambiguation_element_internal,
+  disambiguation_element_user, disambiguation_element_note, and removed_part.
+- removed_part must describe the removed/obscured tool, argument, or result.
+- disambiguation fields should be null unless the mutation explicitly creates
+  an ambiguity rather than a missing capability/result.
+- Do not include chain-of-thought, explanations outside JSON, or markdown.
+
+Input JSON:
+{{input_json}}

@@ -1,0 +1,44 @@
+Create one disambiguation_user Augmented ToolMind record.
+
+Goal:
+Turn the source sample into a case where the user request is underspecified or
+ambiguous, so the assistant must ask a clarification question before making the
+tool call.
+
+Use disambiguation_target and suggested_disambiguation_element_internal from
+the input JSON as guidance. The final ambiguity can be user-facing or internal:
+- user-facing ambiguity: the user did not provide a required value, preference,
+  identifier, date, location, count, format, etc.
+- internal ambiguity: multiple tools/actions/states could satisfy the request
+  and the assistant needs clarification before choosing.
+
+Generation procedure to follow internally:
+1. Identify the original tool call and selected argument.
+2. Rewrite only the relevant user message so that selected detail is missing or
+   ambiguous while preserving the rest of the task.
+3. Generate the first assistant response as a clarification question.
+4. The first assistant response must not include tool_calls.
+5. Keep tools available; this task is about ambiguity, not missing capability.
+6. You may stop after the clarification question. If you continue the trace,
+   only call tools after the user provides the missing detail.
+
+Metadata field rules:
+- Fill disambiguation_element_user when the missing information should come
+  from the user, e.g. "window percentage", "destination city", "date range".
+- Fill disambiguation_element_internal when the ambiguity is about tool/action
+  selection or internal state, e.g. "which lights to turn on", "which account".
+- It is valid to fill only one of those two fields and leave the other null.
+- disambiguation_element_note is optional; use null unless a short note adds
+  useful clarity.
+- removed_part must be null.
+
+Output requirements:
+- Return exactly one JSON object.
+- task_type must be disambiguation_user.
+- Use the requested task_id exactly.
+- Include conversations, tools, metadata, disambiguation_element_internal,
+  disambiguation_element_user, disambiguation_element_note, and removed_part.
+- Do not include chain-of-thought, explanations outside JSON, or markdown.
+
+Input JSON:
+{{input_json}}
