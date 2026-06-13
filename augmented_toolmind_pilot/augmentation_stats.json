@@ -1,0 +1,30 @@
+[
+  {
+    "input_file": "BUTTONInstruct-query.jsonl",
+    "output_file": "D:\\GitHub\\augmented-toolmind\\augmented_toolmind_pilot\\BUTTONInstruct-query.jsonl",
+    "input": 20,
+    "base_written": 20,
+    "hallucination_written": 20,
+    "disambiguation_written": 20,
+    "failed_generation": 0,
+    "failed_validation": 0,
+    "skipped": 0,
+    "output_total": 60,
+    "target_total": 60,
+    "output_percent": 100.0
+  },
+  {
+    "input_file": "TOTAL",
+    "output_file": "",
+    "input": 20,
+    "base_written": 20,
+    "hallucination_written": 20,
+    "disambiguation_written": 20,
+    "failed_generation": 0,
+    "failed_validation": 0,
+    "skipped": 0,
+    "output_total": 60,
+    "target_total": 60,
+    "output_percent": 100.0
+  }
+]

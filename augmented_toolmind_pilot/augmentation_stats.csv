@@ -1,0 +1,3 @@
+input_file,output_file,input,base_written,hallucination_written,disambiguation_written,failed_generation,failed_validation,skipped,output_total,target_total,output_percent
+BUTTONInstruct-query.jsonl,D:\GitHub\augmented-toolmind\augmented_toolmind_pilot\BUTTONInstruct-query.jsonl,20,20,20,20,0,0,0,60,60,100.0
+TOTAL,,20,20,20,20,0,0,0,60,60,100.0

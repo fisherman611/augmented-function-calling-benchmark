@@ -1,0 +1,1 @@
+{"source_file": "glaive-function-calling-v2-query.jsonl", "source_line": 10, "source_id": "glaive-function-calling-v2-query.jsonl:10", "task_type": "disambiguation_user", "generation_error": null, "validation_error": "attempt 3: ValidationError: first disambiguation assistant message must not include tool_calls.", "mutation": {}}

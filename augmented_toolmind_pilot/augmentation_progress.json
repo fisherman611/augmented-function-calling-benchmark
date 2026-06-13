@@ -1,0 +1,25 @@
+{
+  "files": {
+    "glaive-function-calling-v2-query.jsonl": {
+      "last_completed_line": 12,
+      "stats": {
+        "input_file": "glaive-function-calling-v2-query.jsonl",
+        "output_file": "D:\\GitHub\\augmented-toolmind\\augmented_toolmind_pilot\\glaive-function-calling-v2-query.jsonl",
+        "input": 12,
+        "base_written": 12,
+        "hallucination_written": 12,
+        "disambiguation_written": 11,
+        "failed_generation": 0,
+        "failed_validation": 1,
+        "skipped": 1,
+        "output_total": 35,
+        "target_total": 36,
+        "output_percent": 97.2222
+      }
+    }
+  },
+  "provider": "nim",
+  "model": "openai/gpt-oss-120b",
+  "source_dataset": "D:\\GitHub\\augmented-toolmind\\toolmind_tool_calls_only\\open_datasets\\glaive-function-calling-v2-query.jsonl",
+  "updated_at_unix": 1781261190
+}

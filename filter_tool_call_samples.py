@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -19,6 +20,10 @@ try:
     from tqdm import tqdm
 except ImportError:  # pragma: no cover - optional dependency
     tqdm = None
+
+
+DEFAULT_HF_REPO = "Nanbeige/ToolMind"
+DEFAULT_HF_ALLOW_PATTERNS = ["*.jsonl", "**/*.jsonl"]
 
 
 @dataclass
@@ -76,6 +81,36 @@ def make_output_path(input_file: Path, input_root: Path, output_root: Path) -> P
 def count_lines(input_file: Path) -> int:
     with input_file.open("rb") as handle:
         return sum(1 for _ in handle)
+
+
+def download_hf_snapshot(
+    *,
+    repo_id: str,
+    revision: str | None,
+    cache_dir: str | None,
+    token_env: str | None,
+    allow_patterns: list[str],
+    local_files_only: bool,
+) -> Path:
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "huggingface_hub is required for --source hf/auto when local input is missing. "
+            "Install it with `python -m pip install huggingface_hub`."
+        ) from exc
+
+    token = os.environ.get(token_env) if token_env else None
+    snapshot_path = snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        revision=revision,
+        cache_dir=cache_dir,
+        token=token,
+        allow_patterns=allow_patterns,
+        local_files_only=local_files_only,
+    )
+    return Path(snapshot_path).resolve()
 
 
 def filter_file(
@@ -183,7 +218,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         default="toolmind",
-        help="Input .jsonl file or directory to scan recursively. Default: toolmind",
+        help=(
+            "Input .jsonl file or directory. With --source auto, this is used if it exists; "
+            "otherwise the dataset is downloaded from Hugging Face cache. Default: toolmind"
+        ),
     )
     parser.add_argument(
         "--output",
@@ -210,6 +248,46 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable tqdm progress bars.",
     )
+    parser.add_argument(
+        "--source",
+        choices=("auto", "local", "hf"),
+        default="auto",
+        help="Read from local path, Hugging Face, or local-if-present-else-HF. Default: auto",
+    )
+    parser.add_argument(
+        "--hf-repo",
+        default=DEFAULT_HF_REPO,
+        help=f"Hugging Face dataset repo id used with --source hf/auto. Default: {DEFAULT_HF_REPO}",
+    )
+    parser.add_argument(
+        "--hf-revision",
+        default=None,
+        help="Optional Hugging Face revision/branch/commit.",
+    )
+    parser.add_argument(
+        "--hf-cache-dir",
+        default=None,
+        help="Optional Hugging Face cache directory. Defaults to the standard HF cache.",
+    )
+    parser.add_argument(
+        "--hf-token-env",
+        default="HF_TOKEN",
+        help="Environment variable containing a Hugging Face token, if needed. Default: HF_TOKEN",
+    )
+    parser.add_argument(
+        "--hf-allow-pattern",
+        action="append",
+        default=None,
+        help=(
+            "File pattern to download from Hugging Face. Can be repeated. "
+            "Default downloads only JSONL files."
+        ),
+    )
+    parser.add_argument(
+        "--hf-local-files-only",
+        action="store_true",
+        help="Use only files already present in the Hugging Face cache; do not download.",
+    )
     return parser.parse_args()
 
 
@@ -218,7 +296,22 @@ def main() -> int:
     input_path = Path(args.input).resolve()
     output_root = Path(args.output).resolve()
 
-    if not input_path.exists():
+    if args.source == "local":
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input path does not exist: {input_path}")
+    elif args.source == "hf" or (args.source == "auto" and not input_path.exists()):
+        allow_patterns = args.hf_allow_pattern or DEFAULT_HF_ALLOW_PATTERNS
+        print(f"Loading dataset from Hugging Face cache/repo: {args.hf_repo}")
+        input_path = download_hf_snapshot(
+            repo_id=args.hf_repo,
+            revision=args.hf_revision,
+            cache_dir=args.hf_cache_dir,
+            token_env=args.hf_token_env,
+            allow_patterns=allow_patterns,
+            local_files_only=args.hf_local_files_only,
+        )
+        print(f"Using HF snapshot path: {input_path}")
+    elif not input_path.exists():
         raise FileNotFoundError(f"Input path does not exist: {input_path}")
 
     if output_root.exists() and not args.allow_existing_output and not args.dry_run:

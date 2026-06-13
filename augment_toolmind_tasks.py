@@ -33,31 +33,14 @@ except ImportError:  # pragma: no cover - optional dependency
 
 TASK_TYPES = ("base", "hallucination_missing_tool", "disambiguation_user")
 NVIDIA_NIM_DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1"
-DEFAULT_PERSONA = (
-    "You are a practical user asking an assistant to complete the requested task. "
-    "You value concise, correct tool use and clear follow-up questions when needed."
-)
-SYSTEM_PROMPT = """You generate Augmented ToolMind benchmark records.
-
-Return exactly one valid JSON object and no surrounding prose.
-Do not use markdown fences.
-Use Augmented ToolMind naming only; do not introduce unrelated benchmark names.
-Use the requested task_id and task_type exactly.
-The generated_trace.messages field must use OpenAI-style messages:
-- user/assistant messages have role and content.
-- assistant tool-call messages may include tool_calls.
-- tool result messages use role "tool", name when known, tool_call_id when known, and content.
-
-The JSON object must include these top-level fields:
-task_id, task_type, persona, instruction, context_init_config, actions,
-removed_part, disambiguation_element_user, disambiguation_element_note,
-generated_trace, metadata.
-
-context_init_config must be a JSON-encoded string. Use "{}" unless a harmless
-context is directly supported by the source sample.
-actions must be a JSON-encoded string containing a list of action dictionaries.
-metadata can be an object; source metadata will be overwritten by the script.
-"""
+DEFAULT_HF_REPO = "Nanbeige/ToolMind"
+DEFAULT_HF_ALLOW_PATTERNS = ["*.jsonl", "**/*.jsonl"]
+DEFAULT_PROMPTS_DIR = "prompts"
+PROMPT_FILES = {
+    "system": "system.txt",
+    "hallucination_missing_tool": "hallucination_missing_tool.txt",
+    "disambiguation_user": "disambiguation_user.txt",
+}
 
 
 @dataclass
@@ -93,6 +76,28 @@ class FileStats:
         row["output_percent"] = round(self.output_percent, 4)
         return row
 
+    @classmethod
+    def from_row(cls, row: dict[str, Any], output_file: str) -> "FileStats":
+        stats = cls(input_file=str(row.get("input_file", "")), output_file=output_file)
+
+        def to_int(value: Any) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+
+        for field in (
+            "input",
+            "base_written",
+            "hallucination_written",
+            "disambiguation_written",
+            "failed_generation",
+            "failed_validation",
+            "skipped",
+        ):
+            setattr(stats, field, to_int(row.get(field, 0)))
+        return stats
+
 
 @dataclass
 class GenerationConfig:
@@ -106,6 +111,13 @@ class GenerationConfig:
     seed: int
     max_source_chars: int
     disable_response_format: bool
+    source_dataset: str | None
+
+
+@dataclass
+class PromptTemplates:
+    system: str
+    tasks: dict[str, str]
 
 
 class ValidationError(Exception):
@@ -137,6 +149,36 @@ def count_lines(input_file: Path) -> int:
         return sum(1 for _ in handle)
 
 
+def download_hf_snapshot(
+    *,
+    repo_id: str,
+    revision: str | None,
+    cache_dir: str | None,
+    token_env: str | None,
+    allow_patterns: list[str],
+    local_files_only: bool,
+) -> Path:
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "huggingface_hub is required for --source hf/auto when local input is missing. "
+            "Install it with `python -m pip install huggingface_hub`."
+        ) from exc
+
+    token = os.environ.get(token_env) if token_env else None
+    snapshot_path = snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        revision=revision,
+        cache_dir=cache_dir,
+        token=token,
+        allow_patterns=allow_patterns,
+        local_files_only=local_files_only,
+    )
+    return Path(snapshot_path).resolve()
+
+
 def load_env_file(env_file: Path) -> None:
     """Load KEY=VALUE pairs from a .env file without overriding the shell env."""
     if not env_file.exists():
@@ -157,6 +199,32 @@ def load_env_file(env_file: Path) -> None:
             if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
                 value = value[1:-1]
             os.environ[key] = value
+
+
+def read_prompt_file(path: Path) -> str:
+    if not path.exists():
+        raise FileNotFoundError(f"Prompt file does not exist: {path}")
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        raise ValueError(f"Prompt file is empty: {path}")
+    return text
+
+
+def load_prompt_templates(prompts_dir: Path) -> PromptTemplates:
+    return PromptTemplates(
+        system=read_prompt_file(prompts_dir / PROMPT_FILES["system"]),
+        tasks={
+            task_type: read_prompt_file(prompts_dir / PROMPT_FILES[task_type])
+            for task_type in ("hallucination_missing_tool", "disambiguation_user")
+        },
+    )
+
+
+def render_prompt(template: str, payload: dict[str, Any]) -> str:
+    input_json = json.dumps(payload, ensure_ascii=False, indent=2)
+    if "{{input_json}}" in template:
+        return template.replace("{{input_json}}", input_json)
+    return template + "\n\nInput JSON:\n" + input_json
 
 
 def safe_id_part(value: str) -> str:
@@ -465,6 +533,7 @@ def select_disambiguation_target(
 def build_prompt(
     task_type: str,
     *,
+    prompt_templates: PromptTemplates,
     task_id: str,
     source_id: str,
     source_payload: dict[str, Any],
@@ -474,23 +543,6 @@ def build_prompt(
     disambiguation_target: dict[str, Any] | None,
     validation_feedback: str | None,
 ) -> str:
-    instructions: dict[str, str] = {
-        "base": """Create a base Augmented ToolMind record.
-Preserve the source task intent, tool names, tool call order, tool arguments,
-and final-answer behavior. Do not invent new tools. The generated_trace must
-contain at least one assistant tool call.""",
-        "hallucination_missing_tool": """Create a hallucination_missing_tool Augmented ToolMind record.
-Use the mutation target to make the original task impossible or underspecified.
-The assistant must not fabricate unavailable data and must not call tools that
-the mutation removes. The assistant should clearly explain what is missing and,
-when useful, ask the user for a valid next step.""",
-        "disambiguation_user": """Create a disambiguation_user Augmented ToolMind record.
-Rewrite the instruction so the selected argument is missing or ambiguous.
-The first assistant response must ask a clarification question and must not
-include tool_calls. You may continue the trace after the user supplies the
-missing detail if it stays consistent with the source sample.""",
-    }
-
     payload = {
         "task_id": task_id,
         "task_type": task_type,
@@ -503,29 +555,34 @@ missing detail if it stays consistent with the source sample.""",
         "required_output_shape": {
             "task_id": task_id,
             "task_type": task_type,
-            "persona": DEFAULT_PERSONA,
-            "instruction": "user-facing task instruction",
-            "context_init_config": "{}",
-            "actions": json.dumps(actions, ensure_ascii=False),
-            "removed_part": None,
+            "conversations": [],
+            "tools": [],
+            "metadata": {},
+            "disambiguation_element_internal": None,
             "disambiguation_element_user": None,
             "disambiguation_element_note": None,
-            "generated_trace": {
-                "trajectory_id": f"traj_{task_id}",
-                "task_id": task_id,
-                "messages": [],
-            },
-            "metadata": {},
+            "removed_part": None,
         },
     }
+    if task_type == "hallucination_missing_tool":
+        payload["required_output_shape"]["removed_part"] = mutation.get("removed_part") if mutation else []
+    if task_type == "disambiguation_user":
+        payload["suggested_disambiguation_element_internal"] = {
+            "tool": disambiguation_target.get("tool") if disambiguation_target else None,
+            "argument_name": disambiguation_target.get("argument_name") if disambiguation_target else None,
+            "argument_value": disambiguation_target.get("argument_value") if disambiguation_target else None,
+        }
+        payload["required_output_shape"]["disambiguation_element_internal"] = "fill only if the ambiguity is internal/tool-state related, otherwise null"
+        payload["required_output_shape"]["disambiguation_element_user"] = "fill only if the ambiguity is missing user-provided info, otherwise null"
+        payload["required_output_shape"]["disambiguation_element_note"] = "optional short note, or null"
     if validation_feedback:
         payload["previous_validation_error"] = validation_feedback
 
-    return instructions[task_type] + "\n\nInput JSON:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    return render_prompt(prompt_templates.tasks[task_type], payload)
 
 
 class LLMGenerator:
-    def __init__(self, config: GenerationConfig):
+    def __init__(self, config: GenerationConfig, system_prompt: str):
         try:
             from openai import OpenAI
         except ImportError as exc:  # pragma: no cover
@@ -543,12 +600,13 @@ class LLMGenerator:
             kwargs["base_url"] = config.base_url
         self.client = OpenAI(**kwargs)
         self.config = config
+        self.system_prompt = system_prompt
 
     def complete_json(self, prompt: str) -> dict[str, Any]:
         request: dict[str, Any] = {
             "model": self.config.model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": prompt},
             ],
             "temperature": self.config.temperature,
@@ -589,7 +647,7 @@ def parse_json_object(content: str) -> dict[str, Any]:
 
 
 def has_generated_tool_call(record: dict[str, Any]) -> bool:
-    messages = record.get("generated_trace", {}).get("messages", [])
+    messages = record.get("conversations", [])
     if not isinstance(messages, list):
         return False
     for message in messages:
@@ -600,7 +658,7 @@ def has_generated_tool_call(record: dict[str, Any]) -> bool:
 
 def generated_tool_names(record: dict[str, Any]) -> list[str]:
     names: list[str] = []
-    messages = record.get("generated_trace", {}).get("messages", [])
+    messages = record.get("conversations", [])
     if not isinstance(messages, list):
         return names
     for message in messages:
@@ -619,7 +677,7 @@ def generated_tool_names(record: dict[str, Any]) -> list[str]:
 
 
 def first_assistant_message(record: dict[str, Any]) -> dict[str, Any] | None:
-    messages = record.get("generated_trace", {}).get("messages", [])
+    messages = record.get("conversations", [])
     if not isinstance(messages, list):
         return None
     for message in messages:
@@ -632,14 +690,12 @@ def validate_record(record: dict[str, Any], task_type: str, mutation: dict[str, 
     required = [
         "task_id",
         "task_type",
-        "persona",
-        "instruction",
-        "context_init_config",
-        "actions",
-        "removed_part",
+        "disambiguation_element_internal",
         "disambiguation_element_user",
         "disambiguation_element_note",
-        "generated_trace",
+        "removed_part",
+        "conversations",
+        "tools",
         "metadata",
     ]
     for key in required:
@@ -649,40 +705,31 @@ def validate_record(record: dict[str, Any], task_type: str, mutation: dict[str, 
     if record.get("task_type") != task_type:
         raise ValidationError(f"Unexpected task_type: {record.get('task_type')}")
 
-    trace = record.get("generated_trace")
-    if not isinstance(trace, dict) or not isinstance(trace.get("messages"), list):
-        raise ValidationError("generated_trace.messages must be a list.")
-
-    if not isinstance(record.get("actions"), str):
-        raise ValidationError("actions must be a JSON-encoded string.")
-    try:
-        actions_value = json.loads(record["actions"])
-    except json.JSONDecodeError as exc:
-        raise ValidationError(f"actions is not valid JSON: {exc}") from exc
-    if not isinstance(actions_value, list):
-        raise ValidationError("actions JSON must decode to a list.")
-
-    if not isinstance(record.get("context_init_config"), str):
-        raise ValidationError("context_init_config must be a JSON-encoded string.")
-    try:
-        context_value = json.loads(record["context_init_config"])
-    except json.JSONDecodeError as exc:
-        raise ValidationError(f"context_init_config is not valid JSON: {exc}") from exc
-    if not isinstance(context_value, dict):
-        raise ValidationError("context_init_config JSON must decode to an object.")
+    conversations = record.get("conversations")
+    if not isinstance(conversations, list):
+        raise ValidationError("conversations must be a list.")
+    if not isinstance(record.get("tools"), list):
+        raise ValidationError("tools must be a list.")
 
     if task_type == "base" and not has_generated_tool_call(record):
         raise ValidationError("base record must contain at least one tool call.")
 
     if task_type == "hallucination_missing_tool" and mutation:
+        if not record.get("removed_part"):
+            raise ValidationError("hallucination record must include removed_part.")
         if mutation.get("mutation_type") == "remove_tool":
             removed = mutation.get("removed_tool")
             if removed in generated_tool_names(record):
                 raise ValidationError(f"hallucination record called removed tool: {removed}")
+            for tool in record.get("tools", []):
+                if isinstance(tool, dict):
+                    schema = normalize_tool_schema(tool)
+                    if schema is not None and schema["name"] == removed:
+                        raise ValidationError(f"hallucination tools still include removed tool: {removed}")
         if mutation.get("mutation_type") == "remove_tool_result":
             excerpt = mutation.get("removed_result_excerpt")
             if excerpt:
-                serialized_trace = json.dumps(trace, ensure_ascii=False)
+                serialized_trace = json.dumps(conversations, ensure_ascii=False)
                 if str(excerpt)[:120] in serialized_trace:
                     raise ValidationError("hallucination record reused removed tool result content.")
 
@@ -695,8 +742,8 @@ def validate_record(record: dict[str, Any], task_type: str, mutation: dict[str, 
         content = str(assistant.get("content", "")).strip()
         if "?" not in content and not any(word in content.lower() for word in ("clarify", "provide", "which", "what", "need")):
             raise ValidationError("first disambiguation assistant message does not look like a clarification.")
-        if not record.get("disambiguation_element_user") or not record.get("disambiguation_element_note"):
-            raise ValidationError("disambiguation fields must be filled.")
+        if not record.get("disambiguation_element_internal") and not record.get("disambiguation_element_user"):
+            raise ValidationError("disambiguation record must fill internal or user ambiguity element.")
 
 
 def normalize_record(
@@ -708,35 +755,17 @@ def normalize_record(
     source_line: int,
     config: GenerationConfig,
     mutation: dict[str, Any] | None,
+    disambiguation_target: dict[str, Any] | None,
     original_sample: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    normalized = copy.deepcopy(record)
-    normalized["task_id"] = task_id
-    normalized["task_type"] = task_type
-    normalized.setdefault("persona", DEFAULT_PERSONA)
-    normalized.setdefault("instruction", "")
-    normalized.setdefault("context_init_config", "{}")
-    normalized.setdefault("actions", "[]")
-    normalized.setdefault("removed_part", None)
-    normalized.setdefault("disambiguation_element_user", None)
-    normalized.setdefault("disambiguation_element_note", None)
-
-    trace = normalized.setdefault("generated_trace", {})
-    if not isinstance(trace, dict):
-        trace = {}
-        normalized["generated_trace"] = trace
-    trace["trajectory_id"] = f"traj_{task_id}"
-    trace["task_id"] = task_id
-    trace.setdefault("messages", [])
-
-    metadata = normalized.setdefault("metadata", {})
+    metadata = copy.deepcopy(record.get("metadata", {}))
     if not isinstance(metadata, dict):
         metadata = {}
-        normalized["metadata"] = metadata
     metadata.update(
         {
             "source_file": source_file,
             "source_line": source_line,
+            "source_dataset": config.source_dataset,
             "provider": config.provider,
             "model": config.model,
             "mutation": mutation or {},
@@ -745,12 +774,76 @@ def normalize_record(
     if original_sample is not None:
         metadata["original_sample"] = original_sample
 
+    conversations = copy.deepcopy(record.get("conversations", []))
+    tools = copy.deepcopy(record.get("tools", []))
+    if not isinstance(tools, list) and original_sample is not None:
+        tools = copy.deepcopy(original_sample.get("tools", []))
+    if isinstance(tools, list) and task_type == "hallucination_missing_tool" and mutation:
+        if mutation.get("mutation_type") == "remove_tool":
+            removed_tool = mutation.get("removed_tool")
+            tools = [
+                tool
+                for tool in tools
+                if not (
+                    isinstance(tool, dict)
+                    and normalize_tool_schema(tool) is not None
+                    and normalize_tool_schema(tool)["name"] == removed_tool
+                )
+            ]
+
+    normalized: dict[str, Any] = {
+        "task_id": task_id,
+        "task_type": task_type,
+        "disambiguation_element_internal": None,
+        "disambiguation_element_user": None,
+        "disambiguation_element_note": None,
+        "removed_part": None,
+        "conversations": conversations,
+        "tools": tools,
+        "metadata": metadata,
+    }
+    if task_type == "hallucination_missing_tool":
+        normalized["removed_part"] = record.get("removed_part")
+    if task_type == "disambiguation_user":
+        normalized["disambiguation_element_internal"] = record.get("disambiguation_element_internal")
+        normalized["disambiguation_element_user"] = record.get("disambiguation_element_user")
+        normalized["disambiguation_element_note"] = record.get("disambiguation_element_note")
+
     return normalized
+
+
+def create_base_record(
+    *,
+    task_id: str,
+    source_file: str,
+    source_line: int,
+    sample: dict[str, Any],
+    config: GenerationConfig,
+) -> dict[str, Any]:
+    return {
+        "task_id": task_id,
+        "task_type": "base",
+        "disambiguation_element_internal": None,
+        "disambiguation_element_user": None,
+        "disambiguation_element_note": None,
+        "removed_part": None,
+        "conversations": copy.deepcopy(sample.get("conversations", [])),
+        "tools": copy.deepcopy(sample.get("tools", [])),
+        "metadata": {
+            "source_file": source_file,
+            "source_line": source_line,
+            "source_dataset": config.source_dataset,
+            "provider": config.provider,
+            "model": config.model,
+            "mutation": {},
+        },
+    }
 
 
 def generate_task_record(
     generator: LLMGenerator,
     *,
+    prompt_templates: PromptTemplates,
     task_type: str,
     task_id: str,
     source_id: str,
@@ -772,6 +865,7 @@ def generate_task_record(
         try:
             prompt = build_prompt(
                 task_type,
+                prompt_templates=prompt_templates,
                 task_id=task_id,
                 source_id=source_id,
                 source_payload=source_payload,
@@ -796,6 +890,7 @@ def generate_task_record(
                 source_line=source_line,
                 config=config,
                 mutation=mutation,
+                disambiguation_target=disambiguation_target,
                 original_sample=original_sample if task_type != "base" else None,
             )
             validate_record(normalized, task_type, mutation)
@@ -829,6 +924,48 @@ def write_stats(output_root: Path, stats: list[FileStats]) -> None:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def load_progress(progress_path: Path) -> dict[str, Any]:
+    if not progress_path.exists():
+        return {"files": {}}
+    try:
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"files": {}}
+    if not isinstance(progress, dict):
+        return {"files": {}}
+    files = progress.get("files")
+    if not isinstance(files, dict):
+        progress["files"] = {}
+    return progress
+
+
+def write_progress(progress_path: Path, progress: dict[str, Any]) -> None:
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = progress_path.with_suffix(progress_path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(progress, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temp_path.replace(progress_path)
+
+
+def update_progress_file(
+    progress_path: Path,
+    progress: dict[str, Any],
+    *,
+    source_file: str,
+    last_line: int,
+    stats: FileStats,
+    config: GenerationConfig,
+) -> None:
+    progress.setdefault("files", {})[source_file] = {
+        "last_completed_line": last_line,
+        "stats": stats.to_row(),
+    }
+    progress["provider"] = config.provider
+    progress["model"] = config.model
+    progress["source_dataset"] = config.source_dataset
+    progress["updated_at_unix"] = int(time.time())
+    write_progress(progress_path, progress)
 
 
 def print_summary(stats: list[FileStats]) -> None:
@@ -877,15 +1014,36 @@ def process_file(
     input_root: Path,
     output_root: Path,
     generator: LLMGenerator,
+    prompt_templates: PromptTemplates,
     config: GenerationConfig,
     start_line: int,
     remaining_limit: int | None,
     progress: bool,
     error_handle: Any,
+    checkpoint_interval: int,
+    progress_path: Path,
+    progress_state: dict[str, Any],
+    resume: bool,
 ) -> tuple[FileStats, int | None]:
     source_file = str(input_file.relative_to(input_root) if input_root.is_dir() else input_file.name).replace("\\", "/")
-    stats = FileStats(input_file=source_file, output_file=str(output_file))
+    saved_file_progress = progress_state.get("files", {}).get(source_file, {}) if resume else {}
+    saved_stats = saved_file_progress.get("stats") if isinstance(saved_file_progress, dict) else None
+    if resume and isinstance(saved_stats, dict):
+        stats = FileStats.from_row(saved_stats, str(output_file))
+        stats.input_file = source_file
+        stats.output_file = str(output_file)
+    else:
+        stats = FileStats(input_file=source_file, output_file=str(output_file))
+    last_completed_line = 0
+    if resume and isinstance(saved_file_progress, dict):
+        raw_last_line = saved_file_progress.get("last_completed_line", 0)
+        if isinstance(raw_last_line, int):
+            last_completed_line = raw_last_line
+    latest_completed_line = last_completed_line
+    effective_start_line = max(start_line, last_completed_line + 1)
+    output_mode = "a" if resume else "w"
     output_file.parent.mkdir(parents=True, exist_ok=True)
+    completed_since_checkpoint = 0
 
     progress_bar = None
     try:
@@ -900,12 +1058,12 @@ def process_file(
             )
 
         with input_file.open("r", encoding="utf-8") as reader, output_file.open(
-            "w", encoding="utf-8", newline="\n"
+            output_mode, encoding="utf-8", newline="\n"
         ) as writer:
             for line_number, line in enumerate(reader, start=1):
                 if progress_bar is not None:
                     progress_bar.update(1)
-                if line_number < start_line or not line.strip():
+                if line_number < effective_start_line or not line.strip():
                     continue
                 if remaining_limit is not None and remaining_limit <= 0:
                     break
@@ -923,9 +1081,29 @@ def process_file(
                         validation_error=f"Invalid source JSON: {exc}",
                         mutation=None,
                     )
+                    completed_since_checkpoint += 1
+                    update_progress_file(
+                        progress_path,
+                        progress_state,
+                        source_file=source_file,
+                        last_line=line_number,
+                        stats=stats,
+                        config=config,
+                    )
+                    latest_completed_line = line_number
                     continue
                 if not isinstance(sample, dict):
                     stats.skipped += 3
+                    completed_since_checkpoint += 1
+                    update_progress_file(
+                        progress_path,
+                        progress_state,
+                        source_file=source_file,
+                        last_line=line_number,
+                        stats=stats,
+                        config=config,
+                    )
+                    latest_completed_line = line_number
                     continue
 
                 tool_calls = extract_tool_calls(sample)
@@ -941,6 +1119,16 @@ def process_file(
                         validation_error="No tool calls found in source sample.",
                         mutation=None,
                     )
+                    completed_since_checkpoint += 1
+                    update_progress_file(
+                        progress_path,
+                        progress_state,
+                        source_file=source_file,
+                        last_line=line_number,
+                        stats=stats,
+                        config=config,
+                    )
+                    latest_completed_line = line_number
                     continue
 
                 schemas = normalize_tools(sample.get("tools", []))
@@ -956,12 +1144,41 @@ def process_file(
                 if remaining_limit is not None:
                     remaining_limit -= 1
 
+                sample_records: list[dict[str, Any]] = []
                 for task_type in TASK_TYPES:
                     task_id = make_task_id(source_file, line_number, task_type)
+                    if task_type == "base":
+                        record = create_base_record(
+                            task_id=task_id,
+                            source_file=source_file,
+                            source_line=line_number,
+                            sample=sample,
+                            config=config,
+                        )
+                        try:
+                            validate_record(record, task_type, None)
+                        except Exception as exc:
+                            stats.failed_validation += 1
+                            stats.skipped += 1
+                            write_error(
+                                error_handle,
+                                source_file=source_file,
+                                source_line=line_number,
+                                task_type=task_type,
+                                generation_error=None,
+                                validation_error=f"{type(exc).__name__}: {exc}",
+                                mutation=None,
+                            )
+                            continue
+                        sample_records.append(record)
+                        stats.base_written += 1
+                        continue
+
                     mutation = hallucination_mutation if task_type == "hallucination_missing_tool" else None
                     disamb = disambiguation_target if task_type == "disambiguation_user" else None
                     record, generation_error, validation_error = generate_task_record(
                         generator,
+                        prompt_templates=prompt_templates,
                         task_type=task_type,
                         task_id=task_id,
                         source_id=source_id,
@@ -993,14 +1210,40 @@ def process_file(
                         )
                         continue
 
-                    writer.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    writer.flush()
+                    sample_records.append(record)
                     if task_type == "base":
                         stats.base_written += 1
                     elif task_type == "hallucination_missing_tool":
                         stats.hallucination_written += 1
                     elif task_type == "disambiguation_user":
                         stats.disambiguation_written += 1
+
+                for record in sample_records:
+                    writer.write(json.dumps(record, ensure_ascii=False) + "\n")
+                writer.flush()
+
+                completed_since_checkpoint += 1
+                latest_completed_line = line_number
+                update_progress_file(
+                    progress_path,
+                    progress_state,
+                    source_file=source_file,
+                    last_line=line_number,
+                    stats=stats,
+                    config=config,
+                )
+                if completed_since_checkpoint >= checkpoint_interval:
+                    completed_since_checkpoint = 0
+
+            if stats.input or stats.skipped:
+                update_progress_file(
+                    progress_path,
+                    progress_state,
+                    source_file=source_file,
+                    last_line=latest_completed_line,
+                    stats=stats,
+                    config=config,
+                )
     finally:
         if progress_bar is not None:
             progress_bar.close()
@@ -1012,12 +1255,53 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate Augmented ToolMind task variants from ToolMind JSONL files."
     )
-    parser.add_argument("--input", default="toolmind_tool_calls_only", help="Input .jsonl file or directory.")
+    parser.add_argument(
+        "--input",
+        default="toolmind_tool_calls_only",
+        help=(
+            "Input .jsonl file or directory. With --source auto, this is used if it exists; "
+            "otherwise the dataset is downloaded from Hugging Face cache. Default: toolmind_tool_calls_only"
+        ),
+    )
     parser.add_argument("--output", default="augmented_toolmind", help="Output directory.")
+    parser.add_argument(
+        "--source",
+        choices=("auto", "local", "hf"),
+        default="auto",
+        help="Read from local path, Hugging Face, or local-if-present-else-HF. Default: auto",
+    )
+    parser.add_argument(
+        "--hf-repo",
+        default=DEFAULT_HF_REPO,
+        help=f"Hugging Face dataset repo id used with --source hf/auto. Default: {DEFAULT_HF_REPO}",
+    )
+    parser.add_argument("--hf-revision", default=None, help="Optional Hugging Face revision/branch/commit.")
+    parser.add_argument(
+        "--hf-cache-dir",
+        default=None,
+        help="Optional Hugging Face cache directory. Defaults to the standard HF cache.",
+    )
+    parser.add_argument(
+        "--hf-token-env",
+        default="HF_TOKEN",
+        help="Environment variable containing a Hugging Face token, if needed. Default: HF_TOKEN",
+    )
+    parser.add_argument(
+        "--hf-allow-pattern",
+        action="append",
+        default=None,
+        help="File pattern to download from Hugging Face. Can be repeated. Default downloads only JSONL files.",
+    )
+    parser.add_argument(
+        "--hf-local-files-only",
+        action="store_true",
+        help="Use only files already present in the Hugging Face cache; do not download.",
+    )
     parser.add_argument("--provider", choices=("openai", "nim"), required=True, help="LLM provider.")
     parser.add_argument("--model", required=True, help="Model name.")
     parser.add_argument("--api-key-env", required=True, help="Environment variable containing the API key.")
     parser.add_argument("--env-file", default=".env", help="Optional .env file to load before reading --api-key-env.")
+    parser.add_argument("--prompts-dir", default=DEFAULT_PROMPTS_DIR, help="Directory containing prompt template files.")
     parser.add_argument(
         "--base-url",
         default=None,
@@ -1030,6 +1314,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-line", type=int, default=1, help="Start processing at this source line number.")
     parser.add_argument("--seed", type=int, default=13, help="Seed for deterministic mutation selection.")
     parser.add_argument("--allow-existing-output", action="store_true", help="Allow writing into an existing output dir.")
+    parser.add_argument("--resume", action="store_true", help="Continue from augmentation_progress.json and append output.")
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=10,
+        help="Retained for batch runs; progress is also saved after each completed source sample for safe resume.",
+    )
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     parser.add_argument("--temperature", type=float, default=0.2, help="LLM sampling temperature.")
     parser.add_argument("--max-output-tokens", type=int, default=4096, help="Maximum output tokens per LLM call.")
@@ -1053,18 +1344,37 @@ def main() -> int:
     input_path = Path(args.input).resolve()
     output_root = Path(args.output).resolve()
     env_file = Path(args.env_file).resolve()
+    prompts_dir = Path(args.prompts_dir).resolve()
 
     if args.limit is not None and args.limit <= 0:
         raise ValueError("--limit must be positive when provided.")
     if args.start_line <= 0:
         raise ValueError("--start-line must be >= 1.")
+    if args.checkpoint_interval <= 0:
+        raise ValueError("--checkpoint-interval must be >= 1.")
 
-    if not input_path.exists():
+    if args.source == "local":
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input path does not exist: {input_path}")
+    elif args.source == "hf" or (args.source == "auto" and not input_path.exists()):
+        allow_patterns = args.hf_allow_pattern or DEFAULT_HF_ALLOW_PATTERNS
+        print(f"Loading dataset from Hugging Face cache/repo: {args.hf_repo}")
+        input_path = download_hf_snapshot(
+            repo_id=args.hf_repo,
+            revision=args.hf_revision,
+            cache_dir=args.hf_cache_dir,
+            token_env=args.hf_token_env,
+            allow_patterns=allow_patterns,
+            local_files_only=args.hf_local_files_only,
+        )
+        print(f"Using HF snapshot path: {input_path}")
+    elif not input_path.exists():
         raise FileNotFoundError(f"Input path does not exist: {input_path}")
-    if output_root.exists() and not args.allow_existing_output:
+
+    if output_root.exists() and not args.allow_existing_output and not args.resume:
         raise FileExistsError(
             f"Output directory already exists: {output_root}\n"
-            "Use --allow-existing-output to write into it, or choose a new --output path."
+            "Use --allow-existing-output to write into it, --resume to continue, or choose a new --output path."
         )
 
     files = list(iter_jsonl_files(input_path))
@@ -1088,8 +1398,10 @@ def main() -> int:
         seed=args.seed,
         max_source_chars=args.max_source_chars,
         disable_response_format=args.disable_response_format,
+        source_dataset=args.hf_repo if args.source == "hf" or (args.source == "auto" and not Path(args.input).resolve().exists()) else str(input_path),
     )
-    generator = LLMGenerator(config)
+    prompt_templates = load_prompt_templates(prompts_dir)
+    generator = LLMGenerator(config, prompt_templates.system)
 
     use_progress = not args.no_progress
     if use_progress and tqdm is None:
@@ -1099,11 +1411,14 @@ def main() -> int:
     stats: list[FileStats] = []
     remaining_limit = args.limit
     error_path = output_root / "augmentation_errors.jsonl"
+    progress_path = output_root / "augmentation_progress.json"
+    progress_state = load_progress(progress_path) if args.resume else {"files": {}}
     file_iter: Iterable[Path] = files
     if use_progress and tqdm is not None:
         file_iter = tqdm(files, desc="Files", unit="file", dynamic_ncols=True, file=sys.stdout)
 
-    with error_path.open("w", encoding="utf-8", newline="\n") as error_handle:
+    error_mode = "a" if args.resume else "w"
+    with error_path.open(error_mode, encoding="utf-8", newline="\n") as error_handle:
         for input_file in file_iter:
             if remaining_limit is not None and remaining_limit <= 0:
                 break
@@ -1114,13 +1429,20 @@ def main() -> int:
                 input_root=input_path,
                 output_root=output_root,
                 generator=generator,
+                prompt_templates=prompt_templates,
                 config=config,
                 start_line=args.start_line,
                 remaining_limit=remaining_limit,
                 progress=use_progress,
                 error_handle=error_handle,
+                checkpoint_interval=args.checkpoint_interval,
+                progress_path=progress_path,
+                progress_state=progress_state,
+                resume=args.resume,
             )
             stats.append(file_stats)
+            write_stats(output_root, stats)
+            write_progress(progress_path, progress_state)
 
     write_stats(output_root, stats)
     print_summary(stats)
