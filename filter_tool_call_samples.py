@@ -48,17 +48,25 @@ class FileStats:
 
 
 def has_tool_call(sample: dict[str, Any]) -> bool:
-    """Return True when any conversation message has at least one tool call."""
-    conversations = sample.get("conversations")
-    if not isinstance(conversations, list):
-        return False
-
-    for message in conversations:
-        if not isinstance(message, dict):
+    """Return True when any message has at least one tool call."""
+    for field_name in ("conversations", "messages"):
+        messages = sample.get(field_name)
+        if not isinstance(messages, list):
             continue
-        tool_calls = message.get("tool_calls")
-        if isinstance(tool_calls, list) and len(tool_calls) > 0:
+
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list) and len(tool_calls) > 0:
+                return True
+
+    metadata = sample.get("metadata")
+    if isinstance(metadata, dict):
+        num_tool_calls = metadata.get("num_tool_calls")
+        if isinstance(num_tool_calls, int) and num_tool_calls > 0:
             return True
+
     return False
 
 
