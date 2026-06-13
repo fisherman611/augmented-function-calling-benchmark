@@ -16,7 +16,7 @@ from huggingface_hub import HfApi
 api = HfApi()
 
 api.upload_folder(
-    folder_path="nemotron_sft_agentic_v2_tool_calls_only",
-    repo_id="carbench-ijcai/nemotron_sft_agentic_v2_tool_calls_only",
+    folder_path="nemotron_sft_agentic_v2_prompt_jsonl",
+    repo_id="carbench-ijcai/augment_nemotron_prompts",
     repo_type="dataset",
 )

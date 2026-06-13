@@ -210,6 +210,10 @@ augmented_toolmind/
 # Ruff stuff:
 .ruff_cache/
 
+# Local plotting/dependency cache
+.deps/
+.matplotlib/
+
 # PyPI configuration file
 .pypirc
 
@@ -220,3 +224,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+nemotron_sft_agentic_v2_prompt_jsonl/
+nemotron_sft_agentic_v2_tool_calls_only/

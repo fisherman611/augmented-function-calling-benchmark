@@ -1,4 +1,4 @@
-Create one disambiguation_user Augmented ToolMind record.
+Create one disambiguation_user tool-use record.
 
 Goal:
 Turn the source sample into a case where the user request is underspecified or

@@ -1,9 +1,9 @@
-You generate Augmented ToolMind JSONL records for tool-use training.
+You generate JSONL records for tool-use training.
 
 Return exactly one valid JSON object. Do not return markdown, prose, comments,
 analysis, or hidden reasoning. Do not wrap the JSON in code fences.
 
-Use only Augmented ToolMind naming. Keep the native ToolMind structure:
+Use the requested field names and keep the source conversation structure:
 - task_id
 - task_type
 - disambiguation_element_internal
@@ -21,7 +21,7 @@ the other can remain null. disambiguation_element_note is optional.
 
 Conversation format:
 - user/assistant/tool messages use role and content.
-- assistant tool calls use tool_calls in the source ToolMind style.
+- assistant tool calls use tool_calls in the source conversation style.
 - tool messages must only appear after a valid assistant tool call.
 - do not invent tool results.
 - do not invent tools that are not present in tools.
